@@ -58,8 +58,19 @@ public final class MaidRegistry extends SavedData {
      * deliberately left on disk: that keeps a rollback to an older build working.
      */
     public static MaidRegistry get(MinecraftServer server) {
-        net.minecraft.world.level.storage.DimensionDataStorage storage =
-                server.overworld().getDataStorage();
+        return getFrom(server.overworld().getDataStorage());
+    }
+
+    /**
+     * Fetches the registry from one specific data storage, adopting pre-rename data.
+     *
+     * <p>Needed while a level is still being constructed: the force-load ticket validation hook
+     * in {@link ChunkLoadHelper} fires from there, and for the overworld
+     * {@link MinecraftServer#overworld()} does not answer yet. In that case the level's own
+     * storage is the overworld's storage, so both paths lead to the same file.
+     */
+    public static MaidRegistry getFrom(
+            net.minecraft.world.level.storage.DimensionDataStorage storage) {
         MaidRegistry live = storage.computeIfAbsent(MaidRegistry::load, MaidRegistry::new, DATA_ID);
         MaidRegistry legacy = storage.get(MaidRegistry::load, LEGACY_DATA_ID);
         if (adoptIfEmpty(live, legacy)) {
@@ -160,6 +171,33 @@ public final class MaidRegistry extends SavedData {
     public boolean isForceLoad(UUID owner, UUID maidId) {
         Set<UUID> set = forceLoad.get(owner);
         return set != null && set.contains(maidId);
+    }
+
+    /**
+     * True when <em>anybody</em> still keeps this maid force loaded.
+     *
+     * <p>Used to decide whether a stored chunk ticket is still wanted: one whose maid nobody has
+     * switched on any more is stale, and keeping it would hold and tick its chunk forever.
+     */
+    public boolean isForceLoadByAnyone(UUID maidId) {
+        for (Set<UUID> maids : forceLoad.values()) {
+            if (maids.contains(maidId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True when at least one maid is force loaded for somebody. */
+    public boolean hasAnyForceLoad() {
+        // An owner entry can exist with nothing in it (turning a switch off leaves the set
+        // behind), so the empty ones must not count as a use.
+        for (Set<UUID> maids : forceLoad.values()) {
+            if (!maids.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public void setForceLoad(UUID owner, UUID maidId, boolean enabled) {

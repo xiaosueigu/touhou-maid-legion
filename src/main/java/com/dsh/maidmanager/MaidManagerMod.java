@@ -1,5 +1,6 @@
 package com.dsh.maidmanager;
 
+import com.dsh.maidmanager.logic.ChunkLoadHelper;
 import com.dsh.maidmanager.logic.MaidManagerService;
 import com.dsh.maidmanager.network.NetworkHandler;
 import com.mojang.logging.LogUtils;
@@ -32,6 +33,10 @@ public final class MaidManagerMod {
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, Config.SPEC);
 
         NetworkHandler.register();
+
+        // Registered before any level is loaded: it is what drops the force-load tickets of an
+        // earlier session instead of letting Forge reinstate them.
+        ChunkLoadHelper.registerForcedChunkValidation();
         forgeBus.addListener(this::onRegisterCommands);
         forgeBus.addListener(this::onServerStarted);
         forgeBus.addListener(this::onServerStopping);
