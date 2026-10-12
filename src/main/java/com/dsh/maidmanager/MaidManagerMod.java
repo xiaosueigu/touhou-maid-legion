@@ -35,8 +35,9 @@ public final class MaidManagerMod {
     public MaidManagerMod(IEventBus modBus, ModContainer container) {
         container.registerConfig(ModConfig.Type.COMMON, Config.SPEC);
 
-        // NeoForge requires a TicketController to be registered before it can hold chunks.
-        // This is a mod-bus event, and ChunkLoadHelper.forceChunk() throws if it never ran.
+        // NeoForge requires a TicketController to be registered before it can hold chunks; ours
+        // also carries the level-load hook that drops stale force-load tickets. This is a mod-bus
+        // event, and the controller's forceChunk() throws if it never ran.
         modBus.addListener(com.dsh.maidmanager.logic.ChunkLoadHelper::registerController);
 
         // Payloads register themselves through NetworkHandler.Registrar; nothing to do here.

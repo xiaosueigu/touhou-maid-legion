@@ -865,17 +865,11 @@ public final class MaidManagerService {
         long deadline = server.getTickCount() + Config.COMMON.forceLoadTimeoutTicks.get();
         PENDING.put(maidId, new PendingSummon(player.getUUID(), maidId, deadline));
 
-        // Hold the chunk. The maid does not exist as an entity yet, so there is no entity
-        // ticket owner to use; hold it on the level keyed by chunk, and release it as soon as
-        // the summon resolves or times out.
-        try {
-            net.minecraft.world.level.ChunkPos chunk = new net.minecraft.world.level.ChunkPos(pos);
-            ChunkLoadHelper.holdRaw(target, chunk, maidId);
-        } catch (Throwable t) {
-            MaidManagerMod.LOGGER.warn("Could not start force-load for maid {}: {}", maidId, t.toString());
-            PENDING.remove(maidId);
-            return false;
-        }
+        // Hold the chunk. TicketController needs an owner and the maid does not exist yet, so the
+        // ticket is keyed on her UUID, which is stable across the reload. ChunkLoadHelper records
+        // it as well, so that it is released again when the summon finishes or times out: a ticket
+        // nobody releases outlives the server process and keeps its chunk entity-ticking forever.
+        ChunkLoadHelper.take(target, maidId, new net.minecraft.world.level.ChunkPos(pos));
         return true;
     }
 
@@ -907,6 +901,7 @@ public final class MaidManagerService {
             ServerPlayer owner = server.getPlayerList().getPlayer(pending.ownerId());
             if (owner == null) {
                 iterator.remove();
+                keepOrReleaseTicket(server, pending.maidId());
                 continue;
             }
             EntityMaid maid = findLoadedMaid(owner, pending.maidId());
@@ -918,22 +913,40 @@ public final class MaidManagerService {
                 } else {
                     owner.sendSystemMessage(Component.translatable("message.touhou_maid_legion.cannot_reach"));
                 }
+                // The temporary ticket has done its job. It is kept only while the maid's own
+                // switch is on, in which case tickForceLoadedMaids holds her chunk from now on.
+                keepOrReleaseTicket(server, pending.maidId());
                 com.dsh.maidmanager.network.MaidActionHandler.refresh(owner);
                 continue;
             }
             if (now > pending.deadline()) {
                 iterator.remove();
                 owner.sendSystemMessage(Component.translatable("message.touhou_maid_legion.force_load_timeout"));
-                // Release the ticket we took, otherwise it would leak.
+                // The summon gave up, so its ticket has to go with it.
                 releaseForceLoad(server, pending.maidId());
             }
         }
     }
 
-    /** Releases a force-loaded chunk previously taken for a maid. */
+    /** Releases the force-load ticket held for a maid, in whichever level it was taken. */
     public static void releaseForceLoad(MinecraftServer server, UUID maidId) {
-        for (ServerLevel level : server.getAllLevels()) {
-            ChunkLoadHelper.release(level, maidId);
+        // The level matters: the same maid id can hold a ticket in more than one dimension, and
+        // the previous "try every level" loop cleared our record on the first level, so a ticket
+        // in another dimension was never released at all.
+        ChunkLoadHelper.release(server, maidId);
+    }
+
+    /**
+     * Drops a finished summon's ticket unless somebody still keeps that maid force loaded.
+     *
+     * <p>A summon that ends without a maid to hand the chunk over to - the owner logged off, or
+     * she could not be reached - must not leave its ticket behind. The tickets are stored in the
+     * level's saved data and reinstated on every later start, so an orphaned ticket keeps loading
+     * and ticking its chunk for good.
+     */
+    private static void keepOrReleaseTicket(MinecraftServer server, UUID maidId) {
+        if (!MaidRegistry.get(server).isForceLoadByAnyone(maidId)) {
+            releaseForceLoad(server, maidId);
         }
     }
 
@@ -943,26 +956,34 @@ public final class MaidManagerService {
     }
 
     /**
-     * On server start, re-apply force-loading for every maid whose switch is still on.
+     * On server start, re-asserts the ticket of every force-loaded maid that is currently loaded.
      *
-     * <p>Chunk tickets only live for the lifetime of the server process, so without this a
-     * maid with the switch enabled would silently stop being kept loaded after a restart.
+     * <p>The tickets themselves are persistent - they are stored per controller in the level's
+     * saved data and reinstated while a level loads - but they are reinstated without knowing
+     * whether they are still wanted, and a ticket whose maid was switched off in an earlier
+     * session would keep a chunk ticking forever. Those are dropped by the validation hook in
+     * {@link ChunkLoadHelper}; this pass re-takes the ones that remain, in the level each maid is
+     * actually in now.
      */
     public static void onServerStarted(MinecraftServer server) {
+        MaidRegistry registry = MaidRegistry.get(server);
         for (ServerLevel level : server.getAllLevels()) {
             for (EntityMaid maid : level.getEntitiesOfClass(EntityMaid.class, ALL_ENTITIES)) {
                 UUID owner = maid.getOwnerUUID();
-                if (owner == null) {
-                    continue;
-                }
-                if (MaidRegistry.get(server).isForceLoad(owner, maid.getUUID())) {
+                if (owner != null && registry.isForceLoad(owner, maid.getUUID())) {
                     ChunkLoadHelper.hold(level, maid);
                 }
             }
         }
     }
 
-    /** Releases our bookkeeping when the server stops; Forge drops the tickets itself. */
+    /**
+     * Releases our bookkeeping when the server stops.
+     *
+     * <p>The tickets are deliberately left in place: they are what brings a force-loaded maid back
+     * after a restart. The ones that stopped being wanted are removed by {@link ChunkLoadHelper}
+     * while the levels load, before they can take effect again.
+     */
     public static void onServerStopping(MinecraftServer server) {
         PENDING.clear();
         ChunkLoadHelper.clear();
@@ -974,13 +995,17 @@ public final class MaidManagerService {
      * <p>Covers maids that walked into a new chunk, and re-takes a chunk that was dropped.
      */
     public static void tickForceLoadedMaids(MinecraftServer server) {
+        if (!MaidRegistry.get(server).hasAnyForceLoad()) {
+            return;
+        }
         for (ServerLevel level : server.getAllLevels()) {
-            for (EntityMaid maid : level.getEntitiesOfClass(EntityMaid.class, ALL_ENTITIES)) {
-                UUID owner = maid.getOwnerUUID();
-                if (owner == null) {
-                    continue;
-                }
-                if (MaidRegistry.get(server).isForceLoad(owner, maid.getUUID())) {
+            // Only a maid we already hold a chunk for can need anything here: a maid without a
+            // ticket is not loaded, so no entity of hers could have walked into a new chunk.
+            // Going through our own bookkeeping keeps this off the entity list - the previous
+            // version scanned every loaded entity of every level, once a second, for as long as
+            // the server ran, even when nobody had the switch on at all.
+            for (UUID maidId : ChunkLoadHelper.heldMaids()) {
+                if (level.getEntity(maidId) instanceof EntityMaid maid) {
                     ChunkLoadHelper.hold(level, maid);
                 }
             }
